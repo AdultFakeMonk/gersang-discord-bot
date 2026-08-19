@@ -1,5 +1,9 @@
-import re
+import json
+import os
+import sys
 import time
+from pathlib import Path
+from urllib.parse import urljoin, urlparse
 
 import requests
 import urllib3
@@ -7,7 +11,13 @@ from bs4 import BeautifulSoup
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-URL = "https://www.gersang.co.kr/news/notice.gs?GSbid=1001"
+NOTICE_URL = "https://www.gersang.co.kr/news/notice.gs?GSbid=1001"
+EVENT_URL = "https://www.gersang.co.kr/news/event.gs"
+
+STATE_FILE = Path("last_seen.json")
+
+WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
+MAX_SEND_PER_RUN = int(os.environ.get("MAX_SEND_PER_RUN", "5"))
 
 HEADERS = {
     "User-Agent": (
@@ -19,131 +29,511 @@ HEADERS = {
         "text/html,application/xhtml+xml,application/xml;"
         "q=0.9,image/avif,image/webp,*/*;q=0.8"
     ),
-    "Accept-Language": "ko-KR,ko;q=0.9",
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
     "Referer": "https://www.gersang.co.kr/",
 }
 
-DATE_RE = re.compile(r"20\d{2}[-./]\d{1,2}[-./]\d{1,2}")
 
-
-def fetch():
+def fetch_html(url):
     last_error = None
 
     for attempt in range(5):
         try:
-            r = requests.get(
-                URL,
+            response = requests.get(
+                url,
                 headers=HEADERS,
                 timeout=30,
                 verify=False,
             )
-            r.raise_for_status()
 
-            if not r.encoding or r.encoding.lower() == "iso-8859-1":
-                r.encoding = r.apparent_encoding or "utf-8"
+            response.raise_for_status()
 
-            print(f"HTTP {r.status_code}")
-            print(f"HTML 크기: {len(r.text)} bytes")
+            if not response.encoding or response.encoding.lower() == "iso-8859-1":
+                response.encoding = response.apparent_encoding or "utf-8"
 
-            return r.text
+            print(
+                f"페이지 접속 성공: {url} "
+                f"(HTTP {response.status_code}, {len(response.text)} bytes)"
+            )
+
+            return response.text
 
         except requests.RequestException as e:
             last_error = e
+
             print(f"접속 실패 ({attempt + 1}/5): {e}")
 
             if attempt < 4:
-                time.sleep(5)
+                wait_seconds = 5 * (attempt + 1)
+
+                print(f"{wait_seconds}초 후 다시 시도합니다.")
+
+                time.sleep(wait_seconds)
 
     raise last_error
 
 
-def main():
-    html = fetch()
+def parse_notices(html):
     soup = BeautifulSoup(html, "html.parser")
 
-    print()
-    print("========== 기본 구조 ==========")
-    print("tr 개수:", len(soup.find_all("tr")))
-    print("li 개수:", len(soup.find_all("li")))
-    print("a 개수:", len(soup.find_all("a")))
+    notices = []
 
-    print()
-    print("========== 날짜 주변 HTML ==========")
+    for row in soup.select("div.tr[data-uid]"):
+        uid_text = (row.get("data-uid") or "").strip()
 
-    found = 0
-
-    for text_node in soup.find_all(string=DATE_RE):
-        text = " ".join(text_node.strip().split())
-
-        if not DATE_RE.search(text):
+        if not uid_text.isdigit():
             continue
 
-        found += 1
+        subject = row.select_one(".box-subject")
+        date_box = row.select_one(".box-date")
+        category_box = row.select_one(".box-category")
 
-        print()
-        print(f"----- 날짜 후보 {found} -----")
-        print("텍스트:", text)
+        if subject is None:
+            continue
 
-        parent = text_node.parent
+        title = " ".join(subject.stripped_strings).strip()
 
-        for level in range(4):
-            if parent is None:
-                break
+        if not title:
+            continue
 
-            print()
+        date = ""
+
+        if date_box:
+            date = " ".join(date_box.stripped_strings).strip()
+
+        category = ""
+
+        if category_box:
+            category = " ".join(category_box.stripped_strings).strip()
+
+        notices.append(
+            {
+                "kind": "공지",
+                "id": int(uid_text),
+                "title": title,
+                "date": date,
+                "category": category,
+                "url": NOTICE_URL,
+            }
+        )
+
+    notices.sort(
+        key=lambda item: item["id"],
+        reverse=True,
+    )
+
+    return notices
+
+
+def event_title(a, full_url):
+    text = " ".join(a.stripped_strings).strip()
+
+    if text:
+        return text
+
+    img = a.find("img")
+
+    if img:
+        alt = (img.get("alt") or "").strip()
+
+        if alt and alt.lower() != "image":
+            return alt
+
+    title_attr = (a.get("title") or "").strip()
+
+    if title_attr:
+        return title_attr
+
+    path = urlparse(full_url).path.rstrip("/")
+
+    slug = path.split("/")[-1] if path else ""
+
+    if slug.lower() in {"main.gs", "intro.gs"}:
+        parts = path.split("/")
+
+        slug = parts[-2] if len(parts) >= 2 else slug
+
+    return slug or "새 이벤트"
+
+
+def normalize_event_url(href):
+    full_url = urljoin(EVENT_URL, href)
+
+    parsed = urlparse(full_url)
+
+    if parsed.netloc.lower() not in {
+        "gersang.co.kr",
+        "www.gersang.co.kr",
+    }:
+        return None
+
+    if not parsed.path.lower().startswith("/event/"):
+        return None
+
+    return parsed._replace(
+        query="",
+        fragment="",
+    ).geturl()
+
+
+def parse_events(html):
+    soup = BeautifulSoup(html, "html.parser")
+
+    events = {}
+
+    for a in soup.find_all("a", href=True):
+        full_url = normalize_event_url(
+            a.get("href", "")
+        )
+
+        if not full_url:
+            continue
+
+        title = event_title(
+            a,
+            full_url,
+        )
+
+        events[full_url] = {
+            "kind": "이벤트",
+            "title": title,
+            "date": "",
+            "url": full_url,
+        }
+
+    return list(events.values())
+
+
+def load_state():
+    default = {
+        "notice_last_id": None,
+        "event_seen_urls": [],
+    }
+
+    if not STATE_FILE.exists():
+        return default
+
+    try:
+        data = json.loads(
+            STATE_FILE.read_text(
+                encoding="utf-8"
+            )
+        )
+
+        return {
+            "notice_last_id": data.get(
+                "notice_last_id"
+            ),
+            "event_seen_urls": list(
+                data.get(
+                    "event_seen_urls",
+                    [],
+                )
+            ),
+        }
+
+    except Exception as e:
+        print(
+            f"상태 파일 읽기 실패: {e}"
+        )
+
+        return default
+
+
+def save_state(state):
+    STATE_FILE.write_text(
+        json.dumps(
+            state,
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+def send_discord(item):
+    if not WEBHOOK_URL:
+        raise RuntimeError(
+            "DISCORD_WEBHOOK_URL 환경변수가 없습니다."
+        )
+
+    fields = []
+
+    if item.get("date"):
+        fields.append(
+            {
+                "name": "등록일",
+                "value": item["date"],
+                "inline": True,
+            }
+        )
+
+    kind = item["kind"]
+
+    payload = {
+        "username": "거상 소식 알림",
+        "embeds": [
+            {
+                "title": f"[{kind}] {item['title']}"[:256],
+                "url": item["url"],
+                "description": (
+                    f"거상 홈페이지에 새 "
+                    f"{kind}이(가) 등록되었습니다."
+                ),
+                "fields": fields,
+                "footer": {
+                    "text": "천하제일상 거상 공식 홈페이지"
+                },
+            }
+        ],
+    }
+
+    response = requests.post(
+        WEBHOOK_URL,
+        json=payload,
+        timeout=20,
+    )
+
+    response.raise_for_status()
+
+
+def process_notices(state):
+    print("")
+    print("===== 공지사항 확인 =====")
+
+    try:
+        html = fetch_html(
+            NOTICE_URL
+        )
+
+    except Exception as e:
+        print(
+            f"공지사항 페이지 접속 실패: {e}"
+        )
+
+        return False
+
+    notices = parse_notices(
+        html
+    )
+
+    print(
+        f"공지사항 감지 개수: {len(notices)}"
+    )
+
+    for item in notices[:5]:
+        print(
+            f"감지: ID={item['id']} / "
+            f"{item['date']} / "
+            f"{item['title']}"
+        )
+
+    if not notices:
+        print(
+            "경고: 공지사항 게시물을 찾지 못했습니다."
+        )
+
+        return False
+
+    newest_id = notices[0]["id"]
+
+    last_id = state.get(
+        "notice_last_id"
+    )
+
+    if last_id is None:
+        state["notice_last_id"] = newest_id
+
+        print(
+            f"공지 초기화: 최신 ID {newest_id}을 "
+            "기준점으로 저장"
+        )
+
+        return True
+
+    try:
+        last_id = int(last_id)
+
+    except Exception:
+        last_id = 0
+
+    new_notices = [
+        item
+        for item in notices
+        if item["id"] > last_id
+    ]
+
+    if not new_notices:
+        print(
+            f"새 공지 없음. "
+            f"last={last_id}, newest={newest_id}"
+        )
+
+        return False
+
+    print(
+        f"새 공지 {len(new_notices)}개 발견"
+    )
+
+    new_notices.sort(
+        key=lambda item: item["id"]
+    )
+
+    selected = new_notices[
+        -MAX_SEND_PER_RUN:
+    ]
+
+    for item in selected:
+        send_discord(item)
+
+        print(
+            f"공지 Discord 전송: "
+            f"{item['id']} / "
+            f"{item['title']}"
+        )
+
+    state["notice_last_id"] = max(
+        item["id"]
+        for item in selected
+    )
+
+    return True
+
+
+def process_events(state):
+    print("")
+    print("===== 이벤트 확인 =====")
+
+    try:
+        html = fetch_html(
+            EVENT_URL
+        )
+
+    except Exception as e:
+        print(
+            f"이벤트 페이지 접속 실패: {e}"
+        )
+
+        return False
+
+    events = parse_events(
+        html
+    )
+
+    print(
+        f"이벤트 감지 개수: {len(events)}"
+    )
+
+    if not events:
+        print(
+            "경고: 이벤트를 찾지 못했습니다."
+        )
+
+        return False
+
+    old_seen = set(
+        state.get(
+            "event_seen_urls",
+            [],
+        )
+    )
+
+    current_urls = [
+        item["url"]
+        for item in events
+    ]
+
+    if not old_seen:
+        state["event_seen_urls"] = (
+            current_urls[:100]
+        )
+
+        print(
+            f"이벤트 초기화: 현재 이벤트 "
+            f"{len(current_urls)}개를 기준점으로 저장"
+        )
+
+        return True
+
+    new_events = [
+        item
+        for item in events
+        if item["url"] not in old_seen
+    ]
+
+    if new_events:
+        print(
+            f"새 이벤트 "
+            f"{len(new_events)}개 발견"
+        )
+
+        for item in new_events[
+            :MAX_SEND_PER_RUN
+        ]:
+            send_discord(item)
+
             print(
-                f"[부모 단계 {level}] "
-                f"태그={parent.name} "
-                f"class={parent.get('class')} "
-                f"id={parent.get('id')}"
+                f"이벤트 Discord 전송: "
+                f"{item['title']}"
             )
 
-            snippet = str(parent)
+    else:
+        print("새 이벤트 없음")
 
-            if len(snippet) > 2000:
-                snippet = snippet[:2000] + "...(생략)"
+    merged = []
 
-            print(snippet)
+    for url in (
+        current_urls
+        + list(old_seen)
+    ):
+        if url not in merged:
+            merged.append(url)
 
-            parent = parent.parent
+    new_state = merged[:100]
 
-        if found >= 5:
-            break
+    changed = (
+        new_state
+        != state.get(
+            "event_seen_urls",
+            [],
+        )
+    )
 
-    print()
-    print("========== 링크 후보 ==========")
+    state["event_seen_urls"] = new_state
 
-    count = 0
+    return changed
 
-    for a in soup.find_all("a"):
-        href = (a.get("href") or "").strip()
-        onclick = (a.get("onclick") or "").strip()
-        text = " ".join(a.stripped_strings).strip()
 
-        combined = f"{href} {onclick} {text}".lower()
+def main():
+    print(
+        "거상 공지/이벤트 확인을 시작합니다."
+    )
 
-        if (
-            "notice" not in combined
-            and "gsbid" not in combined
-            and "main=" not in combined
-            and "view" not in combined
-        ):
-            continue
+    state = load_state()
 
-        count += 1
+    changed = False
 
-        print()
-        print(f"----- 링크 {count} -----")
-        print("TEXT:", text[:300])
-        print("HREF:", href)
-        print("ONCLICK:", onclick)
+    if process_notices(state):
+        changed = True
 
-        if count >= 30:
-            break
+    if process_events(state):
+        changed = True
 
-    print()
-    print("========== 진단 완료 ==========")
+    if changed:
+        save_state(state)
+
+        print("")
+        print("상태 파일 저장 완료")
+
+    else:
+        print("")
+        print("상태 변경 없음")
+
+    print("")
+    print("확인 작업 완료")
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
