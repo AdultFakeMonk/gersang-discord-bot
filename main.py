@@ -2,6 +2,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from urllib.parse import urljoin, urlparse, parse_qs
 
@@ -15,18 +16,49 @@ WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
 MAX_SEND_PER_RUN = int(os.environ.get("MAX_SEND_PER_RUN", "5"))
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; GersangDiscordWatcher/2.0; +https://github.com/)"
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/140.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;"
+        "q=0.9,image/avif,image/webp,*/*;q=0.8"
+    ),
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Referer": "https://www.gersang.co.kr/",
 }
 
 DATE_RE = re.compile(r"20\d{2}[-./]\d{1,2}[-./]\d{1,2}")
 
 
 def fetch_html(url: str) -> str:
-    response = requests.get(url, headers=HEADERS, timeout=20)
-    response.raise_for_status()
-    if not response.encoding or response.encoding.lower() == "iso-8859-1":
-        response.encoding = response.apparent_encoding or "utf-8"
-    return response.text
+    last_error = None
+
+    for attempt in range(5):
+        try:
+            response = requests.get(
+                url,
+                headers=HEADERS,
+                timeout=30,
+            )
+            response.raise_for_status()
+
+            if not response.encoding or response.encoding.lower() == "iso-8859-1":
+                response.encoding = response.apparent_encoding or "utf-8"
+
+            return response.text
+
+        except requests.RequestException as e:
+            last_error = e
+            print(f"접속 실패 ({attempt + 1}/5): {e}")
+
+            if attempt < 4:
+                wait_seconds = 5 * (attempt + 1)
+                print(f"{wait_seconds}초 후 다시 시도합니다.")
+                time.sleep(wait_seconds)
+
+    raise last_error
 
 
 def extract_notice_id(href: str):
