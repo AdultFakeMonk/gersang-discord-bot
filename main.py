@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -256,6 +257,184 @@ def normalize_event_url(href):
     ).geturl()
 
 
+def normalize_date_string(
+    year,
+    month,
+    day,
+):
+    try:
+        return (
+            f"{int(year):04d}-"
+            f"{int(month):02d}-"
+            f"{int(day):02d}"
+        )
+    except Exception:
+        return ""
+
+
+def extract_event_period(html):
+    """
+    이벤트 상세페이지 안에서
+    '시작 날짜 ~ 종료 날짜' 형태를 찾는다.
+
+    단일 종료일이나 '보상 수령은 ~까지' 같은 문장은
+    이벤트 기간으로 사용하지 않는다.
+    """
+
+    soup = BeautifulSoup(
+        html,
+        "html.parser",
+    )
+
+    text = " ".join(
+        soup.stripped_strings
+    )
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text,
+    )
+
+    # 예:
+    # 2026.02.12. 10:00:00 ~ 2026.02.21. 18:00:00
+    # 2026.02.12 ~ 2026.02.21
+    # 2026-02-12 ~ 2026-02-21
+    # 2026/02/12 ~ 2026/02/21
+    pattern_numeric = re.compile(
+        r"("
+        r"20\d{2}"
+        r")\s*[./-]\s*"
+        r"(\d{1,2})"
+        r"\s*[./-]\s*"
+        r"(\d{1,2})"
+        r"(?:\s*[.]?\s*"
+        r"\d{1,2}:\d{2}"
+        r"(?::\d{2})?"
+        r")?"
+        r"\s*"
+        r"(?:~|～|∼|부터)"
+        r"\s*"
+        r"("
+        r"20\d{2}"
+        r")\s*[./-]\s*"
+        r"(\d{1,2})"
+        r"\s*[./-]\s*"
+        r"(\d{1,2})"
+        r"(?:\s*[.]?\s*"
+        r"\d{1,2}:\d{2}"
+        r"(?::\d{2})?"
+        r")?"
+    )
+
+    match = pattern_numeric.search(
+        text
+    )
+
+    if match:
+        start_date = normalize_date_string(
+            match.group(1),
+            match.group(2),
+            match.group(3),
+        )
+
+        end_date = normalize_date_string(
+            match.group(4),
+            match.group(5),
+            match.group(6),
+        )
+
+        if start_date and end_date:
+            return (
+                f"{start_date} ~ "
+                f"{end_date}"
+            )
+
+    # 예:
+    # 2026년 2월 12일 ~ 2026년 2월 21일
+    # 2026년 2월 12일부터 2026년 2월 21일까지
+    pattern_korean = re.compile(
+        r"("
+        r"20\d{2}"
+        r")\s*년\s*"
+        r"(\d{1,2})\s*월\s*"
+        r"(\d{1,2})\s*일"
+        r"(?:\s*"
+        r"\d{1,2}:\d{2}"
+        r"(?::\d{2})?"
+        r")?"
+        r"\s*"
+        r"(?:~|～|∼|부터)"
+        r"\s*"
+        r"("
+        r"20\d{2}"
+        r")\s*년\s*"
+        r"(\d{1,2})\s*월\s*"
+        r"(\d{1,2})\s*일"
+    )
+
+    match = pattern_korean.search(
+        text
+    )
+
+    if match:
+        start_date = normalize_date_string(
+            match.group(1),
+            match.group(2),
+            match.group(3),
+        )
+
+        end_date = normalize_date_string(
+            match.group(4),
+            match.group(5),
+            match.group(6),
+        )
+
+        if start_date and end_date:
+            return (
+                f"{start_date} ~ "
+                f"{end_date}"
+            )
+
+    return ""
+
+
+def get_event_period(url):
+    try:
+        print(
+            f"이벤트 기간 확인: {url}"
+        )
+
+        html = fetch_html(
+            url
+        )
+
+        period = extract_event_period(
+            html
+        )
+
+        if period:
+            print(
+                f"이벤트 기간 감지: "
+                f"{period}"
+            )
+        else:
+            print(
+                "이벤트 기간을 "
+                "텍스트에서 찾지 못했습니다."
+            )
+
+        return period
+
+    except Exception as e:
+        print(
+            f"이벤트 기간 확인 실패: "
+            f"{e}"
+        )
+
+        return ""
+
+
 def parse_events(html):
     soup = BeautifulSoup(
         html,
@@ -284,6 +463,7 @@ def parse_events(html):
             "kind": "이벤트",
             "title": title,
             "date": "",
+            "period": "",
             "url": full_url,
         }
 
@@ -372,6 +552,18 @@ def send_discord(item):
                 "name": "등록일",
                 "value": item["date"],
                 "inline": True,
+            }
+        )
+
+    if (
+        kind == "이벤트"
+        and item.get("period")
+    ):
+        fields.append(
+            {
+                "name": "이벤트 기간",
+                "value": item["period"],
+                "inline": False,
             }
         )
 
@@ -604,6 +796,12 @@ def process_events(state):
         for item in new_events[
             :MAX_SEND_PER_RUN
         ]:
+            # 새 이벤트일 때만 상세페이지를 열어서
+            # 이벤트 기간을 확인한다.
+            item["period"] = get_event_period(
+                item["url"]
+            )
+
             send_discord(
                 item
             )
