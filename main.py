@@ -7,7 +7,11 @@ from pathlib import Path
 from urllib.parse import urljoin, urlparse, parse_qs
 
 import requests
+import urllib3
 from bs4 import BeautifulSoup
+
+# 거상 사이트의 SSL 인증서 체인 문제로 GitHub Actions에서 검증 오류가 날 수 있어 경고를 숨깁니다.
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 NOTICE_URL = "https://www.gersang.co.kr/news/notice.gs?GSbid=1001"
 EVENT_URL = "https://www.gersang.co.kr/news/event.gs"
@@ -41,6 +45,7 @@ def fetch_html(url: str) -> str:
                 url,
                 headers=HEADERS,
                 timeout=30,
+                verify=False,
             )
             response.raise_for_status()
 
