@@ -1,6 +1,8 @@
+import json
 import os
 import sys
 import time
+from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -22,6 +24,8 @@ EVENT_URL = (
     "news/event.gs"
 )
 
+STATE_FILE = Path("last_seen.json")
+
 NOTICE_WEBHOOK_URL = os.environ.get(
     "DISCORD_NOTICE_WEBHOOK_URL",
     "",
@@ -32,6 +36,12 @@ EVENT_WEBHOOK_URL = os.environ.get(
     "",
 ).strip()
 
+MAX_SEND_PER_RUN = int(
+    os.environ.get(
+        "MAX_SEND_PER_RUN",
+        "5",
+    )
+)
 
 HEADERS = {
     "User-Agent": (
@@ -102,11 +112,7 @@ def fetch_html(url):
     raise last_error
 
 
-def get_latest_notice():
-    html = fetch_html(
-        NOTICE_URL
-    )
-
+def parse_notices(html):
     soup = BeautifulSoup(
         html,
         "html.parser",
@@ -160,17 +166,12 @@ def get_latest_notice():
             }
         )
 
-    if not notices:
-        raise RuntimeError(
-            "공지사항을 찾지 못했습니다."
-        )
-
     notices.sort(
         key=lambda item: item["id"],
         reverse=True,
     )
 
-    return notices[0]
+    return notices
 
 
 def normalize_event_url(href):
@@ -200,17 +201,13 @@ def normalize_event_url(href):
     ).geturl()
 
 
-def get_latest_active_event():
-    html = fetch_html(
-        EVENT_URL
-    )
-
+def parse_events(html):
     soup = BeautifulSoup(
         html,
         "html.parser",
     )
 
-    events = []
+    events = {}
 
     for box in soup.select(
         "div.list-box"
@@ -238,7 +235,7 @@ def get_latest_active_event():
             label_box.stripped_strings
         ).strip()
 
-        # 진행중 이벤트만 테스트 대상
+        # 종료된 이벤트는 추적 대상에서 제외
         if status != "진행중":
             continue
 
@@ -274,38 +271,90 @@ def get_latest_active_event():
                 date_box.stripped_strings
             ).strip()
 
-        events.append(
-            {
-                "kind": "이벤트",
-                "title": title,
-                "status": status,
-                "period": period,
-                "url": full_url,
-            }
+        events[full_url] = {
+            "kind": "이벤트",
+            "title": title,
+            "status": status,
+            "period": period,
+            "url": full_url,
+        }
+
+    return list(
+        events.values()
+    )
+
+
+def load_state():
+    default = {
+        "notice_last_id": None,
+        "event_seen_urls": [],
+    }
+
+    if not STATE_FILE.exists():
+        return default
+
+    try:
+        data = json.loads(
+            STATE_FILE.read_text(
+                encoding="utf-8"
+            )
         )
 
-    if not events:
+        return {
+            "notice_last_id": data.get(
+                "notice_last_id"
+            ),
+            "event_seen_urls": list(
+                data.get(
+                    "event_seen_urls",
+                    [],
+                )
+            ),
+        }
+
+    except Exception as e:
+        print(
+            f"상태 파일 읽기 실패: {e}"
+        )
+
+        return default
+
+
+def save_state(state):
+    STATE_FILE.write_text(
+        json.dumps(
+            state,
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+def send_discord(item):
+    kind = item["kind"]
+
+    if kind == "공지":
+        webhook_url = NOTICE_WEBHOOK_URL
+
+    elif kind == "이벤트":
+        webhook_url = EVENT_WEBHOOK_URL
+
+    else:
         raise RuntimeError(
-            "진행중인 이벤트를 찾지 못했습니다."
+            f"알 수 없는 알림 종류입니다: {kind}"
         )
 
-    return events[0]
-
-
-def send_discord(
-    webhook_url,
-    item,
-):
     if not webhook_url:
         raise RuntimeError(
-            f"{item['kind']}용 "
-            "Discord Webhook이 없습니다."
+            f"{kind}용 Discord Webhook "
+            "환경변수가 없습니다."
         )
 
     fields = []
 
     if (
-        item["kind"] == "공지"
+        kind == "공지"
         and item.get("date")
     ):
         fields.append(
@@ -317,7 +366,7 @@ def send_discord(
         )
 
     if (
-        item["kind"] == "이벤트"
+        kind == "이벤트"
         and item.get("period")
     ):
         fields.append(
@@ -333,13 +382,13 @@ def send_discord(
         "embeds": [
             {
                 "title": (
-                    f"[{item['kind']}] "
+                    f"[{kind}] "
                     f"{item['title']}"
                 )[:256],
                 "url": item["url"],
                 "description": (
-                    "현재 거상 홈페이지 기준 "
-                    "실제 알림 표시 테스트입니다."
+                    f"거상 홈페이지에 새 "
+                    f"{kind}이(가) 등록되었습니다."
                 ),
                 "fields": fields,
                 "footer": {
@@ -361,79 +410,292 @@ def send_discord(
     response.raise_for_status()
 
 
+def process_notices(state):
+    print("")
+    print(
+        "===== 공지사항 확인 ====="
+    )
+
+    try:
+        html = fetch_html(
+            NOTICE_URL
+        )
+
+    except Exception as e:
+        print(
+            "공지사항 페이지 "
+            f"접속 실패: {e}"
+        )
+
+        return False
+
+    notices = parse_notices(
+        html
+    )
+
+    print(
+        f"공지사항 감지 개수: "
+        f"{len(notices)}"
+    )
+
+    for item in notices[:5]:
+        print(
+            f"감지: ID={item['id']} / "
+            f"{item['date']} / "
+            f"{item['title']}"
+        )
+
+    if not notices:
+        print(
+            "경고: 공지사항 게시물을 "
+            "찾지 못했습니다."
+        )
+
+        return False
+
+    newest_id = notices[0]["id"]
+
+    last_id = state.get(
+        "notice_last_id"
+    )
+
+    if last_id is None:
+        state[
+            "notice_last_id"
+        ] = newest_id
+
+        print(
+            f"공지 초기화: 최신 ID "
+            f"{newest_id}을 "
+            "기준점으로 저장"
+        )
+
+        return True
+
+    try:
+        last_id = int(
+            last_id
+        )
+
+    except Exception:
+        last_id = 0
+
+    new_notices = [
+        item
+        for item in notices
+        if item["id"] > last_id
+    ]
+
+    if not new_notices:
+        print(
+            f"새 공지 없음. "
+            f"last={last_id}, "
+            f"newest={newest_id}"
+        )
+
+        return False
+
+    print(
+        f"새 공지 "
+        f"{len(new_notices)}개 발견"
+    )
+
+    new_notices.sort(
+        key=lambda item: item["id"]
+    )
+
+    selected = new_notices[
+        -MAX_SEND_PER_RUN:
+    ]
+
+    for item in selected:
+        send_discord(
+            item
+        )
+
+        print(
+            f"공지 Discord 전송: "
+            f"{item['id']} / "
+            f"{item['title']}"
+        )
+
+    state[
+        "notice_last_id"
+    ] = max(
+        item["id"]
+        for item in selected
+    )
+
+    return True
+
+
+def process_events(state):
+    print("")
+    print(
+        "===== 이벤트 확인 ====="
+    )
+
+    try:
+        html = fetch_html(
+            EVENT_URL
+        )
+
+    except Exception as e:
+        print(
+            "이벤트 페이지 "
+            f"접속 실패: {e}"
+        )
+
+        return False
+
+    events = parse_events(
+        html
+    )
+
+    print(
+        f"진행중 이벤트 감지 개수: "
+        f"{len(events)}"
+    )
+
+    for item in events[:5]:
+        print(
+            f"감지: "
+            f"{item['title']} / "
+            f"{item['period']} / "
+            f"{item['url']}"
+        )
+
+    if not events:
+        print(
+            "경고: 진행중인 이벤트를 "
+            "찾지 못했습니다."
+        )
+
+        return False
+
+    old_seen = set(
+        state.get(
+            "event_seen_urls",
+            [],
+        )
+    )
+
+    current_urls = [
+        item["url"]
+        for item in events
+    ]
+
+    if not old_seen:
+        state[
+            "event_seen_urls"
+        ] = current_urls[:100]
+
+        print(
+            f"이벤트 초기화: "
+            f"현재 진행중 이벤트 "
+            f"{len(current_urls)}개를 "
+            "기준점으로 저장"
+        )
+
+        return True
+
+    new_events = [
+        item
+        for item in events
+        if item["url"] not in old_seen
+    ]
+
+    if new_events:
+        print(
+            f"새 이벤트 "
+            f"{len(new_events)}개 발견"
+        )
+
+        for item in new_events[
+            :MAX_SEND_PER_RUN
+        ]:
+            send_discord(
+                item
+            )
+
+            print(
+                "이벤트 Discord 전송: "
+                f"{item['title']} / "
+                f"{item['period']}"
+            )
+
+    else:
+        print(
+            "새 이벤트 없음"
+        )
+
+    merged = []
+
+    for url in (
+        current_urls
+        + list(old_seen)
+    ):
+        if url not in merged:
+            merged.append(
+                url
+            )
+
+    new_state = merged[:100]
+
+    changed = (
+        new_state
+        != state.get(
+            "event_seen_urls",
+            [],
+        )
+    )
+
+    state[
+        "event_seen_urls"
+    ] = new_state
+
+    return changed
+
+
 def main():
     print(
-        "현재 최신 공지/이벤트 "
-        "Discord 테스트를 시작합니다."
+        "거상 공지/이벤트 "
+        "확인을 시작합니다."
     )
+
+    state = load_state()
+
+    changed = False
+
+    if process_notices(
+        state
+    ):
+        changed = True
+
+    if process_events(
+        state
+    ):
+        changed = True
+
+    if changed:
+        save_state(
+            state
+        )
+
+        print("")
+        print(
+            "상태 파일 저장 완료"
+        )
+
+    else:
+        print("")
+        print(
+            "상태 변경 없음"
+        )
 
     print("")
     print(
-        "===== 최신 공지 테스트 ====="
-    )
-
-    notice = get_latest_notice()
-
-    print(
-        f"공지 ID: {notice['id']}"
-    )
-
-    print(
-        f"공지 제목: {notice['title']}"
-    )
-
-    print(
-        f"등록일: {notice['date']}"
-    )
-
-    send_discord(
-        NOTICE_WEBHOOK_URL,
-        notice,
-    )
-
-    print(
-        "최신 공지 Discord 전송 완료"
-    )
-
-    print("")
-    print(
-        "===== 진행중 이벤트 테스트 ====="
-    )
-
-    event = get_latest_active_event()
-
-    print(
-        f"이벤트 제목: "
-        f"{event['title']}"
-    )
-
-    print(
-        f"상태: "
-        f"{event['status']}"
-    )
-
-    print(
-        f"이벤트 기간: "
-        f"{event['period']}"
-    )
-
-    print(
-        f"이벤트 링크: "
-        f"{event['url']}"
-    )
-
-    send_discord(
-        EVENT_WEBHOOK_URL,
-        event,
-    )
-
-    print(
-        "진행중 이벤트 Discord 전송 완료"
-    )
-
-    print("")
-    print(
-        "테스트 완료"
+        "확인 작업 완료"
     )
 
     return 0
