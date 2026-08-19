@@ -1,152 +1,332 @@
-import os
 import sys
+import time
 
 import requests
+import urllib3
+from bs4 import BeautifulSoup
 
 
-NOTICE_WEBHOOK_URL = os.environ.get(
-    "DISCORD_NOTICE_WEBHOOK_URL",
-    "",
-).strip()
+urllib3.disable_warnings(
+    urllib3.exceptions.InsecureRequestWarning
+)
 
-EVENT_WEBHOOK_URL = os.environ.get(
-    "DISCORD_EVENT_WEBHOOK_URL",
-    "",
-).strip()
+EVENT_URL = "https://www.gersang.co.kr/news/event.gs"
+
+TARGET_TITLE = "천하제일 낚시 대회!"
 
 
-def send_discord(item):
-    kind = item["kind"]
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/140.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;"
+        "q=0.9,image/avif,image/webp,*/*;q=0.8"
+    ),
+    "Accept-Language": (
+        "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7"
+    ),
+    "Referer": "https://www.gersang.co.kr/",
+}
 
-    if kind == "공지":
-        webhook_url = NOTICE_WEBHOOK_URL
 
-    elif kind == "이벤트":
-        webhook_url = EVENT_WEBHOOK_URL
+def fetch_html(url):
+    last_error = None
 
-    else:
-        raise RuntimeError(
-            f"알 수 없는 알림 종류입니다: {kind}"
-        )
+    for attempt in range(5):
+        try:
+            response = requests.get(
+                url,
+                headers=HEADERS,
+                timeout=30,
+                verify=False,
+            )
 
-    if not webhook_url:
-        raise RuntimeError(
-            f"{kind}용 Discord Webhook 환경변수가 없습니다."
-        )
+            response.raise_for_status()
 
-    fields = []
+            if (
+                not response.encoding
+                or response.encoding.lower() == "iso-8859-1"
+            ):
+                response.encoding = (
+                    response.apparent_encoding
+                    or "utf-8"
+                )
 
-    # 공지 등록일
-    if item.get("date"):
-        fields.append(
-            {
-                "name": "등록일",
-                "value": item["date"],
-                "inline": True,
-            }
-        )
+            print(
+                f"페이지 접속 성공: {url} "
+                f"(HTTP {response.status_code}, "
+                f"{len(response.text)} bytes)"
+            )
 
-    # 이벤트 기간
-    if (
-        kind == "이벤트"
-        and item.get("period")
-    ):
-        fields.append(
-            {
-                "name": "이벤트 기간",
-                "value": item["period"],
-                "inline": False,
-            }
-        )
+            return response.text
 
-    payload = {
-        "username": "거상 소식 알림",
-        "embeds": [
-            {
-                "title": (
-                    f"[{kind}] "
-                    f"{item['title']}"
-                )[:256],
-                "url": item["url"],
-                "description": (
-                    f"거상 홈페이지에 새 "
-                    f"{kind}이(가) 등록되었습니다."
-                ),
-                "fields": fields,
-                "footer": {
-                    "text": (
-                        "천하제일상 거상 "
-                        "공식 홈페이지"
-                    )
-                },
-            }
-        ],
-    }
+        except requests.RequestException as e:
+            last_error = e
 
-    response = requests.post(
-        webhook_url,
-        json=payload,
-        timeout=20,
-    )
+            print(
+                f"접속 실패 "
+                f"({attempt + 1}/5): {e}"
+            )
 
-    response.raise_for_status()
+            if attempt < 4:
+                wait_seconds = 5 * (attempt + 1)
+
+                print(
+                    f"{wait_seconds}초 후 "
+                    "다시 시도합니다."
+                )
+
+                time.sleep(wait_seconds)
+
+    raise last_error
 
 
 def main():
     print(
-        "Discord 공지/이벤트 "
-        "표시 형식 테스트를 시작합니다."
+        "거상 이벤트 목록 HTML 진단을 시작합니다."
+    )
+
+    html = fetch_html(
+        EVENT_URL
+    )
+
+    soup = BeautifulSoup(
+        html,
+        "html.parser",
+    )
+
+    print("")
+    print("===== 기본 구조 =====")
+    print(
+        "a 개수:",
+        len(
+            soup.find_all(
+                "a"
+            )
+        ),
+    )
+
+    print(
+        "div 개수:",
+        len(
+            soup.find_all(
+                "div"
+            )
+        ),
+    )
+
+    print(
+        "li 개수:",
+        len(
+            soup.find_all(
+                "li"
+            )
+        ),
     )
 
     print("")
     print(
-        "===== 공지 알림 테스트 ====="
+        "===== 대상 이벤트 검색 ====="
     )
 
-    send_discord(
-        {
-            "kind": "공지",
-            "title": "8월 19일 본서버 임시점검 안내",
-            "date": "2026-08-19",
-            "url": (
-                "https://www.gersang.co.kr/"
-                "news/notice.gs?GSbid=1001"
-            ),
-        }
-    )
+    found = False
 
-    print(
-        "공지 테스트 메시지 전송 완료"
-    )
+    # 먼저 제목 문자열이 들어있는 태그를 직접 찾음
+    for tag in soup.find_all(
+        string=lambda text: (
+            text
+            and TARGET_TITLE in text
+        )
+    ):
+        found = True
+
+        print("")
+        print(
+            "대상 이벤트 제목 발견:"
+        )
+
+        print(
+            tag.strip()
+        )
+
+        parent = tag.parent
+
+        for level in range(6):
+            if parent is None:
+                break
+
+            print("")
+            print(
+                f"----- 부모 단계 {level} -----"
+            )
+
+            print(
+                "태그:",
+                parent.name,
+            )
+
+            print(
+                "class:",
+                parent.get("class"),
+            )
+
+            print(
+                "id:",
+                parent.get("id"),
+            )
+
+            print(
+                "href:",
+                parent.get("href"),
+            )
+
+            print(
+                "data-*:",
+                {
+                    key: value
+                    for key, value
+                    in parent.attrs.items()
+                    if key.startswith("data-")
+                },
+            )
+
+            snippet = str(
+                parent
+            )
+
+            if len(snippet) > 5000:
+                snippet = (
+                    snippet[:5000]
+                    + "...(생략)"
+                )
+
+            print(
+                snippet
+            )
+
+            parent = (
+                parent.parent
+            )
+
+        break
 
     print("")
     print(
-        "===== 이벤트 알림 테스트 ====="
+        "===== 링크 기준 검색 ====="
     )
 
-    send_discord(
-        {
-            "kind": "이벤트",
-            "title": "이벤트 기간 표시 테스트",
-            "date": "",
-            "period": (
-                "2026-08-20 ~ "
-                "2026-09-10"
-            ),
-            "url": (
-                "https://www.gersang.co.kr/"
-                "news/event.gs"
-            ),
-        }
-    )
+    link_count = 0
 
-    print(
-        "이벤트 테스트 메시지 전송 완료"
-    )
+    for a in soup.find_all(
+        "a",
+        href=True,
+    ):
+        text = " ".join(
+            a.stripped_strings
+        ).strip()
+
+        href = (
+            a.get("href")
+            or ""
+        ).strip()
+
+        combined = (
+            f"{text} {href}"
+        )
+
+        if (
+            TARGET_TITLE not in combined
+            and "/event/" not in href.lower()
+        ):
+            continue
+
+        link_count += 1
+
+        print("")
+        print(
+            f"----- 링크 후보 {link_count} -----"
+        )
+
+        print(
+            "TEXT:",
+            text,
+        )
+
+        print(
+            "HREF:",
+            href,
+        )
+
+        print(
+            "CLASS:",
+            a.get("class"),
+        )
+
+        parent = (
+            a.parent
+        )
+
+        for level in range(4):
+            if parent is None:
+                break
+
+            print("")
+            print(
+                f"[링크 부모 단계 {level}]"
+            )
+
+            print(
+                "태그:",
+                parent.name,
+            )
+
+            print(
+                "class:",
+                parent.get("class"),
+            )
+
+            snippet = str(
+                parent
+            )
+
+            if len(snippet) > 4000:
+                snippet = (
+                    snippet[:4000]
+                    + "...(생략)"
+                )
+
+            print(
+                snippet
+            )
+
+            parent = (
+                parent.parent
+            )
+
+        if link_count >= 10:
+            break
 
     print("")
     print(
-        "공지/이벤트 표시 형식 테스트 완료"
+        "===== 진단 결과 ====="
+    )
+
+    if found:
+        print(
+            f"'{TARGET_TITLE}' 이벤트를 "
+            "HTML에서 찾았습니다."
+        )
+    else:
+        print(
+            f"'{TARGET_TITLE}' 이벤트 제목을 "
+            "HTML 텍스트에서 찾지 못했습니다."
+        )
+
+    print(
+        "이벤트 목록 HTML 진단 완료"
     )
 
     return 0
