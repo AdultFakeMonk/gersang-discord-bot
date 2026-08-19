@@ -507,21 +507,6 @@ def process_events(state):
 def main():
     print("거상 공지/이벤트 확인을 시작합니다.")
 
-    # Discord Webhook 즉시 테스트
-    print("")
-    print("===== Discord 테스트 =====")
-
-    send_discord(
-        {
-            "kind": "테스트",
-            "title": "거상 Discord Webhook 테스트",
-            "date": "2026-08-19",
-            "url": "https://www.gersang.co.kr/",
-        }
-    )
-
-    print("Discord 테스트 메시지 전송 완료")
-
     state = load_state()
 
     changed = False
