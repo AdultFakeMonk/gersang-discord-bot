@@ -1,4 +1,3 @@
-import io
 import json
 import os
 import re
@@ -10,7 +9,6 @@ from urllib.parse import urljoin, urlparse
 import requests
 import urllib3
 from bs4 import BeautifulSoup
-from PIL import Image
 
 
 urllib3.disable_warnings(
@@ -23,14 +21,17 @@ urllib3.disable_warnings(
 # ============================================================
 
 NOTICE_URL = (
-    "https://www.gersang.co.kr/news/notice.gs?GSbid=1001"
+    "https://www.gersang.co.kr/"
+    "news/notice.gs?GSbid=1001"
 )
 
 EVENT_URL = (
-    "https://www.gersang.co.kr/news/event.gs"
+    "https://www.gersang.co.kr/"
+    "news/event.gs"
 )
 
 STATE_FILE = Path("last_seen.json")
+
 
 NOTICE_WEBHOOK_URL = os.environ.get(
     "DISCORD_NOTICE_WEBHOOK_URL",
@@ -48,45 +49,6 @@ MAX_SEND_PER_RUN = int(
         "5",
     )
 )
-
-
-# ============================================================
-# 이미지 테스트 설정
-# ============================================================
-
-# 현재 진행중인 "천하제일 낚시 대회!"를
-# 이미지 크기 테스트용으로 한 번 전송합니다.
-#
-# 테스트가 성공하면 last_seen.json에 기록되어
-# 같은 테스트를 계속 반복하지 않습니다.
-#
-# 최종 운영용으로 전환할 때는 False로 바꾸세요.
-
-FORCE_IMAGE_TEST_ONCE = True
-
-TEST_EVENT_TITLE = (
-    "천하제일 낚시 대회!"
-)
-
-IMAGE_TEST_STATE_KEY = (
-    "image_test_v3_sent"
-)
-
-
-# ============================================================
-# Discord 이미지 최대 가로 크기
-# ============================================================
-
-# 거상 원본 이미지 예:
-# 1920 x 610
-#
-# 여기서는 최대 가로 480px로 줄입니다.
-# 비율은 그대로 유지합니다.
-#
-# 더 작게 하고 싶으면
-# 420 / 400 / 360 등으로 바꾸면 됩니다.
-
-MAX_IMAGE_WIDTH = 480
 
 
 # ============================================================
@@ -148,12 +110,12 @@ def fetch_html(url):
 
             return response.text
 
-        except requests.RequestException as exc:
-            last_error = exc
+        except requests.RequestException as e:
+            last_error = e
 
             print(
                 f"접속 실패 "
-                f"({attempt + 1}/5): {exc}"
+                f"({attempt + 1}/5): {e}"
             )
 
             if attempt < 4:
@@ -304,7 +266,8 @@ def normalize_image_url(
 
     if image_url.startswith("//"):
         image_url = (
-            "https:" + image_url
+            "https:"
+            + image_url
         )
 
     full_url = urljoin(
@@ -326,7 +289,7 @@ def normalize_image_url(
 
 
 # ============================================================
-# CSS background-image URL 추출
+# CSS background-image에서 URL 추출
 # ============================================================
 
 def extract_background_image(
@@ -381,7 +344,10 @@ def extract_event_image(
         "data-original-src",
     ]
 
-    for img in box.select("img"):
+    # img 태그
+    for img in box.select(
+        "img"
+    ):
         for attr in image_attributes:
             image_url = normalize_image_url(
                 img.get(attr),
@@ -437,7 +403,7 @@ def extract_event_image(
 
 
 # ============================================================
-# 이벤트 상세페이지 이미지 확인
+# 이벤트 상세페이지에서 이미지 찾기
 # ============================================================
 
 def extract_detail_page_image(
@@ -449,7 +415,8 @@ def extract_detail_page_image(
     )
 
     print(
-        f"상세페이지 확인: {event_url}"
+        f"상세페이지 이미지 확인: "
+        f"{event_url}"
     )
 
     try:
@@ -457,10 +424,10 @@ def extract_detail_page_image(
             event_url
         )
 
-    except Exception as exc:
+    except Exception as e:
         print(
             f"이벤트 상세페이지 "
-            f"접속 실패: {exc}"
+            f"접속 실패: {e}"
         )
 
         return None
@@ -541,7 +508,7 @@ def parse_events(html):
             label_box.stripped_strings
         ).strip()
 
-        # 진행중 이벤트만
+        # 진행중인 이벤트만
         if status != "진행중":
             continue
 
@@ -579,13 +546,13 @@ def parse_events(html):
                 date_box.stripped_strings
             ).strip()
 
-        # 이벤트 목록 대표 이미지
+        # 이벤트 대표 이미지 추출
         image_url = extract_event_image(
             box,
             EVENT_URL,
         )
 
-        # 목록에서 못 찾으면 상세페이지 확인
+        # 목록에서 못 찾으면 상세페이지에서 검색
         if not image_url:
             image_url = (
                 extract_detail_page_image(
@@ -626,7 +593,6 @@ def load_state():
     default = {
         "notice_last_id": None,
         "event_seen_urls": [],
-        IMAGE_TEST_STATE_KEY: False,
     }
 
     if not STATE_FILE.exists():
@@ -649,17 +615,11 @@ def load_state():
                     [],
                 )
             ),
-            IMAGE_TEST_STATE_KEY: bool(
-                data.get(
-                    IMAGE_TEST_STATE_KEY,
-                    False,
-                )
-            ),
         }
 
-    except Exception as exc:
+    except Exception as e:
         print(
-            f"상태 파일 읽기 실패: {exc}"
+            f"상태 파일 읽기 실패: {e}"
         )
 
         return default
@@ -677,13 +637,22 @@ def save_state(state):
 
 
 # ============================================================
-# 이벤트 이미지 다운로드 + 리사이즈
+# 이벤트 이미지 다운로드
 # ============================================================
 
-def download_and_resize_event_image(
+def download_event_image(
     image_url,
     event_url,
 ):
+    """
+    Discord가 거상 서버에서 직접 이미지를
+    가져가도록 하지 않고,
+    GitHub Actions가 먼저 원본 이미지를
+    다운로드한 뒤 Discord에 파일로 첨부합니다.
+
+    이미지 크기는 변경하지 않습니다.
+    """
+
     print("")
     print(
         "이벤트 이미지 다운로드 시작"
@@ -716,117 +685,64 @@ def download_and_resize_event_image(
                 "이미지 응답 내용이 비어 있습니다."
             )
 
-        original = Image.open(
-            io.BytesIO(
-                response.content
+        content_type = (
+            response.headers.get(
+                "Content-Type",
+                "",
             )
+            .split(";")[0]
+            .strip()
+            .lower()
         )
-
-        original.load()
 
         print(
-            f"원본 이미지 해상도: "
-            f"{original.width}x"
-            f"{original.height}"
+            f"이미지 다운로드 성공 "
+            f"(HTTP {response.status_code})"
         )
-
-        # 최대 가로폭까지만 축소
-        if (
-            original.width
-            > MAX_IMAGE_WIDTH
-        ):
-            ratio = (
-                MAX_IMAGE_WIDTH
-                / original.width
-            )
-
-            new_width = (
-                MAX_IMAGE_WIDTH
-            )
-
-            new_height = max(
-                1,
-                round(
-                    original.height
-                    * ratio
-                ),
-            )
-
-            resized = original.resize(
-                (
-                    new_width,
-                    new_height,
-                ),
-                Image.Resampling.LANCZOS,
-            )
-
-        else:
-            resized = original.copy()
 
         print(
-            f"Discord용 이미지 크기: "
-            f"{resized.width}x"
-            f"{resized.height}"
+            f"Content-Type: "
+            f"{content_type}"
         )
 
-        # JPEG 변환
-        if resized.mode in {
-            "RGBA",
-            "LA",
+        print(
+            f"이미지 크기: "
+            f"{len(response.content)} bytes"
+        )
+
+        # 확장자 결정
+        extension = ".jpg"
+
+        if content_type == "image/png":
+            extension = ".png"
+
+        elif content_type == "image/webp":
+            extension = ".webp"
+
+        elif content_type == "image/gif":
+            extension = ".gif"
+
+        elif content_type in {
+            "image/jpeg",
+            "image/jpg",
         }:
-            background = Image.new(
-                "RGB",
-                resized.size,
-                "white",
-            )
+            extension = ".jpg"
 
-            alpha = resized.getchannel(
-                "A"
-            )
-
-            background.paste(
-                resized,
-                mask=alpha,
-            )
-
-            resized = background
-
-        else:
-            resized = (
-                resized.convert(
-                    "RGB"
-                )
-            )
-
-        output = io.BytesIO()
-
-        resized.save(
-            output,
-            format="JPEG",
-            quality=88,
-            optimize=True,
-            progressive=True,
-        )
-
-        image_bytes = (
-            output.getvalue()
-        )
-
-        print(
-            f"리사이즈 이미지 크기: "
-            f"{len(image_bytes)} bytes"
+        filename = (
+            "gersang_event_image"
+            + extension
         )
 
         return (
-            "gersang_event_image.jpg",
-            image_bytes,
-            "image/jpeg",
+            filename,
+            response.content,
+            content_type or "image/jpeg",
         )
 
-    except Exception as exc:
+    except requests.RequestException as e:
         print(
-            f"이벤트 이미지 처리 실패: "
-            f"{exc}"
+            f"이벤트 이미지 다운로드 실패: "
+            f"{e}"
         )
 
         return None
@@ -914,13 +830,16 @@ def send_discord(item):
 
     image_file = None
 
-    # 이벤트 이미지 처리
+    # --------------------------------------------------------
+    # 이벤트는 원본 대표 이미지를 첨부
+    # --------------------------------------------------------
+
     if (
         kind == "이벤트"
         and item.get("image_url")
     ):
         image_file = (
-            download_and_resize_event_image(
+            download_event_image(
                 item["image_url"],
                 item["url"],
             )
@@ -939,9 +858,14 @@ def send_discord(item):
             }
 
             print(
-                "Discord Embed에 "
-                "리사이즈 이미지 연결: "
+                "Discord Embed 이미지 연결: "
                 f"attachment://{filename}"
+            )
+
+        else:
+            print(
+                "이미지 다운로드 실패. "
+                "이미지 없이 Discord 전송"
             )
 
     payload = {
@@ -1010,10 +934,10 @@ def process_notices(state):
             NOTICE_URL
         )
 
-    except Exception as exc:
+    except Exception as e:
         print(
             f"공지사항 페이지 "
-            f"접속 실패: {exc}"
+            f"접속 실패: {e}"
         )
 
         return False
@@ -1066,10 +990,7 @@ def process_notices(state):
             last_id
         )
 
-    except (
-        TypeError,
-        ValueError,
-    ):
+    except Exception:
         last_id = 0
 
     new_notices = [
@@ -1136,10 +1057,10 @@ def process_events(state):
             EVENT_URL
         )
 
-    except Exception as exc:
+    except Exception as e:
         print(
             f"이벤트 페이지 "
-            f"접속 실패: {exc}"
+            f"접속 실패: {e}"
         )
 
         return False
@@ -1186,89 +1107,8 @@ def process_events(state):
         for item in events
     ]
 
-    changed = False
-
     # --------------------------------------------------------
-    # 천하제일 낚시 대회 이미지 테스트
-    # --------------------------------------------------------
-
-    if (
-        FORCE_IMAGE_TEST_ONCE
-        and not state.get(
-            IMAGE_TEST_STATE_KEY,
-            False,
-        )
-    ):
-        test_item = None
-
-        for item in events:
-            if TEST_EVENT_TITLE in (
-                item["title"]
-            ):
-                test_item = item
-                break
-
-        if test_item:
-            print("")
-            print(
-                "===== 이벤트 이미지 테스트 v3 ====="
-            )
-
-            print(
-                f"테스트 대상: "
-                f"{test_item['title']}"
-            )
-
-            print(
-                f"테스트 기간: "
-                f"{test_item['period']}"
-            )
-
-            print(
-                f"테스트 링크: "
-                f"{test_item['url']}"
-            )
-
-            print(
-                f"테스트 이미지: "
-                f"{test_item.get('image_url')}"
-            )
-
-            try:
-                send_discord(
-                    test_item
-                )
-
-                print(
-                    "이미지 크기 테스트 "
-                    "Discord 전송 성공"
-                )
-
-                state[
-                    IMAGE_TEST_STATE_KEY
-                ] = True
-
-                changed = True
-
-            except Exception as exc:
-                print(
-                    "이미지 크기 테스트 "
-                    f"Discord 전송 실패: "
-                    f"{exc}"
-                )
-
-                raise
-
-        else:
-            print(
-                f"테스트 대상 이벤트 "
-                f"'{TEST_EVENT_TITLE}'을 "
-                "현재 진행중 이벤트 목록에서 "
-                "찾지 못했습니다."
-            )
-
-    # --------------------------------------------------------
-    # 최초 실행
+    # 첫 실행
     # --------------------------------------------------------
 
     if not old_seen:
@@ -1314,8 +1154,6 @@ def process_events(state):
                 f"{item['period']}"
             )
 
-        changed = True
-
     else:
         print(
             "새 이벤트 없음"
@@ -1338,20 +1176,22 @@ def process_events(state):
 
     new_state = merged[:100]
 
-    if (
+    changed = (
         new_state
         != state.get(
             "event_seen_urls",
             [],
         )
-    ):
-        changed = True
+    )
 
     state[
         "event_seen_urls"
     ] = new_state
 
-    return changed
+    return (
+        changed
+        or bool(new_events)
+    )
 
 
 # ============================================================
@@ -1368,16 +1208,19 @@ def main():
 
     changed = False
 
+    # 공지 확인
     if process_notices(
         state
     ):
         changed = True
 
+    # 이벤트 확인
     if process_events(
         state
     ):
         changed = True
 
+    # 상태 저장
     if changed:
         save_state(
             state
